@@ -69,7 +69,5 @@ class BurpExtender(IBurpExtender, IContextMenuFactory, IHttpRequestResponse):
         if headers:
             cmd += "-H " + " ".join(headers) + " "
 
-        if body:
-            cmd += '-d "{}" '.format(body)
 
         self.copyToClipboard(cmd)
