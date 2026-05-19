@@ -1,73 +1,186 @@
+# -*- coding: utf-8 -*-
 from burp import IBurpExtender, IContextMenuFactory, IHttpRequestResponse
 from javax.swing import JMenuItem
 from java.awt import Toolkit
 from java.awt.datatransfer import StringSelection
 
+
 class BurpExtender(IBurpExtender, IContextMenuFactory, IHttpRequestResponse):
-    
+
     def registerExtenderCallbacks(self, callbacks):
+
         self._callbacks = callbacks
         self._helpers = callbacks.getHelpers()
+
         callbacks.setExtensionName("Copy as X8 Command")
         callbacks.registerContextMenuFactory(self)
 
     def createMenuItems(self, invocation):
+
         items = []
-        if invocation.getInvocationContext() == invocation.CONTEXT_MESSAGE_EDITOR_REQUEST:
-            item = JMenuItem("Copy as X8 Command", actionPerformed=lambda _: self.copyAsX8Command(invocation))
-            items.append(item)
+
+        valid_contexts = [
+            invocation.CONTEXT_MESSAGE_EDITOR_REQUEST,
+            invocation.CONTEXT_MESSAGE_VIEWER_REQUEST,
+            invocation.CONTEXT_TARGET_SITE_MAP_TREE,
+            invocation.CONTEXT_TARGET_SITE_MAP_TABLE,
+            invocation.CONTEXT_PROXY_HISTORY,
+        ]
+
+        if invocation.getInvocationContext() in valid_contexts:
+
+            selected = invocation.getSelectedMessages()
+
+            if selected and len(selected) > 0:
+
+                item = JMenuItem(
+                    "Copy as X8 Command",
+                    actionPerformed=lambda _: self.copyAsX8Command(invocation)
+                )
+
+                items.append(item)
+
         return items
 
     def copyToClipboard(self, data):
+
         clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
-        selection = StringSelection(data)
-        clipboard.setContents(selection, None)
+        clipboard.setContents(StringSelection(data), None)
+
+    #
+    # Safe POSIX quoting (Jython compatible)
+    #
+    def shell_quote(self, value):
+
+        if value is None:
+            return "''"
+
+        value = str(value)
+
+        if value == "":
+            return "''"
+
+        return "'" + value.replace("'", "'\"'\"'") + "'"
 
     def copyAsX8Command(self, invocation):
-        http = invocation.getSelectedMessages()[0]
-        request_str = self._helpers.bytesToString(http.getRequest())
 
-        # Parse request line
-        head = request_str.split('\r\n')[0]
-        method = head.split()[0]
+        messages = invocation.getSelectedMessages()
 
-        # Parse URL
+        if not messages:
+            return
+
+        http = messages[0]
+
+        request_bytes = http.getRequest()
+        request_info = self._helpers.analyzeRequest(http)
+        request_str = self._helpers.bytesToString(request_bytes)
+
+        #
+        # METHOD + URL
+        #
+        method = request_info.getMethod()
         url = http.getUrl().toString()
 
-        # Parse headers
-        raw_headers = request_str.split('\r\n\r\n')[0].split('\r\n')[1:]
+        #
+        # HEADERS
+        #
         headers = []
-        skip_list = ["Host", "Content-Length", "Connection", "Accept-Encoding", "Accept"]
+        content_type = ""
 
-        for h in raw_headers:
+        for h in request_info.getHeaders()[1:]:
+
             if ":" not in h:
                 continue
-            k = h.split(":", 1)[0].strip()
-            v = h.split(":", 1)[1].strip()
-            if k in skip_list:
+
+            k, v = h.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+
+            if k.lower() == "content-type":
+                content_type = v.lower()
+
+            if k in [
+                "Host",
+                "Content-Length",
+                "Connection",
+                "Accept-Encoding",
+                "Accept"
+            ]:
                 continue
-            
-            # escape quotes
-            k = k.replace("\\", "\\\\").replace("\"", "\\\"")
-            v = v.replace("\\", "\\\\").replace("\"", "\\\"")
 
-            headers.append('"{}: {}"'.format(k, v))
+            headers.append("{}: {}".format(k, v))
 
-        # Parse body
+        #
+        # BODY (FIXED SAFE LOGIC)
+        #
         body = ""
-        if "\r\n\r\n" in request_str:
-            body = request_str.split("\r\n\r\n", 1)[1]
-            body = body.replace("\\", "\\\\").replace("\"", "\\\"")
+        body_offset = request_info.getBodyOffset()
 
-        # Build command
-        cmd = 'x8 -u "{}" '.format(url.replace("\\", "\\\\").replace("\"", "\\\""))
+        if body_offset < len(request_bytes):
 
-        if method != "GET":
-            cmd += '-X {} '.format(method)
+            body = request_str[body_offset:].strip()
 
-        # Append single -H then all headers
+            #
+            # JSON handling → ONLY normalize
+            #
+            if "application/json" in content_type:
+
+                try:
+                    import json
+                    parsed = json.loads(body)
+                    body = json.dumps(parsed, separators=(",", ":"))
+                except:
+                    pass
+
+            #
+            # form-urlencoded → ONLY newline normalization
+            #
+            elif "application/x-www-form-urlencoded" in content_type:
+
+                body = body.replace("\r\n", "&") \
+                           .replace("\r", "&") \
+                           .replace("\n", "&")
+
+        #
+        # BUILD COMMAND
+        #
+        cmd_parts = [
+            "x8",
+            "-u",
+            self.shell_quote(url)
+        ]
+
+        if method and method != "GET":
+            cmd_parts.extend([
+                "-X",
+                self.shell_quote(method)
+            ])
+
+        #
+        # SINGLE -H ARG (x8 requirement)
+        #
         if headers:
-            cmd += "-H " + " ".join(headers) + " "
 
+            combined_headers = "\\n".join(headers)
+
+            cmd_parts.extend([
+                "-H",
+                self.shell_quote(combined_headers)
+            ])
+
+        #
+        # BODY
+        #
+        if body:
+
+            cmd_parts.extend([
+                "-b",
+                self.shell_quote(body)
+            ])
+
+        #
+        # FINAL COMMAND
+        #
+        cmd = " ".join(cmd_parts)
 
         self.copyToClipboard(cmd)
